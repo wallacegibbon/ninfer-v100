@@ -6,6 +6,9 @@
 #include <cstddef>
 #include <span>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace ninfer::artifact {
 namespace {
@@ -167,6 +170,62 @@ ObjectHandle bind_device_tensor(Binder& binder, std::string_view name, NumericFo
 
 ObjectHandle bind_raw_resource(Binder& binder, std::string_view name) {
     const ObjectHandle handle = binder.require_resource(name, ResourceEncoding::RawBytesV1);
+    binder.retain_on_host(handle);
+    return handle;
+}
+
+ObjectHandle bind_group(Binder& binder, std::span<const std::string_view> names,
+                        NumericFormat format, std::initializer_list<std::uint64_t> shape,
+                        TensorPlacement placement) {
+    const ObjectHandle handle =
+        binder.require_group(names, format, storage_layout_for(format),
+                             std::span<const std::uint64_t>(shape.begin(), shape.size()));
+    if (placement == TensorPlacement::Device) {
+        binder.materialize_on_device(handle);
+    } else {
+        binder.validate_only(handle);
+    }
+    return handle;
+}
+
+ObjectHandle bind_device_group(Binder& binder, std::span<const std::string_view> names,
+                               NumericFormat format, std::initializer_list<std::uint64_t> shape) {
+    return bind_group(binder, names, format, shape, TensorPlacement::Device);
+}
+
+ObjectHandle bind_group_roles(Binder& binder, std::string_view prefix,
+                              std::initializer_list<std::string_view> roles, NumericFormat format,
+                              std::initializer_list<std::uint64_t> shape,
+                              TensorPlacement placement) {
+    std::vector<std::string> owned;
+    owned.reserve(roles.size());
+    for (const std::string_view role : roles) {
+        owned.emplace_back(std::string(prefix) + std::string(role));
+    }
+    std::vector<std::string_view> names;
+    names.reserve(owned.size());
+    for (const auto& name : owned) { names.emplace_back(name); }
+    return bind_group(binder, names, format, shape, placement);
+}
+
+ObjectHandle bind_auxiliary(Binder& binder, std::string_view parameter, std::string_view input,
+                            NumericFormat format, std::initializer_list<std::uint64_t> shape,
+                            TensorPlacement placement) {
+    const ObjectHandle handle = binder.require_auxiliary(
+        parameter, input, "activation_input_divisor", format, storage_layout_for(format),
+        std::span<const std::uint64_t>(shape.begin(), shape.size()));
+    if (placement == TensorPlacement::Device) {
+        binder.materialize_on_device(handle);
+    } else {
+        binder.validate_only(handle);
+    }
+    return handle;
+}
+
+ObjectHandle bind_component_resource(Binder& binder, std::string_view component,
+                                     std::string_view role) {
+    const ObjectHandle handle =
+        binder.require_component_resource(component, role, ResourceEncoding::RawBytesV1);
     binder.retain_on_host(handle);
     return handle;
 }

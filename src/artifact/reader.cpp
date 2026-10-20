@@ -1,5 +1,8 @@
 #include "artifact/reader.h"
 
+#include "artifact/framing.h"
+#include "artifact/schema.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -25,13 +28,6 @@ namespace {
 
 using Json = nlohmann::json;
 
-constexpr std::array<std::byte, 8> kMagic = {
-    std::byte{'N'}, std::byte{'I'}, std::byte{'N'}, std::byte{'F'},
-    std::byte{'E'}, std::byte{'R'}, std::byte{0},   std::byte{2},
-};
-constexpr std::uint64_t kPrefixBytes      = 16;
-constexpr std::uint64_t kPayloadAlignment = 4096;
-
 std::uint64_t checked_add(std::uint64_t a, std::uint64_t b, std::string_view label) {
     if (b > std::numeric_limits<std::uint64_t>::max() - a) {
         throw ArtifactError(std::string(label) + " overflows u64");
@@ -42,14 +38,6 @@ std::uint64_t checked_add(std::uint64_t a, std::uint64_t b, std::string_view lab
 std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment, std::string_view label) {
     const auto biased = checked_add(value, alignment - 1, label);
     return biased / alignment * alignment;
-}
-
-std::uint64_t read_u64_le(const std::byte* data) noexcept {
-    std::uint64_t value = 0;
-    for (unsigned i = 0; i < 8; ++i) {
-        value |= std::uint64_t(std::to_integer<unsigned char>(data[i])) << (i * 8);
-    }
-    return value;
 }
 
 template <std::size_t N>
@@ -84,29 +72,23 @@ std::uint64_t require_unsigned(const Json& value, std::string_view label, bool p
 }
 
 NumericFormat parse_format(std::string_view name) {
-    if (name == "BF16") { return NumericFormat::BF16; }
-    if (name == "FP32") { return NumericFormat::FP32; }
-    if (name == "I32") { return NumericFormat::I32; }
-    if (name == "Q4G64_F16S") { return NumericFormat::Q4G64_F16S; }
-    if (name == "Q5G64_F16S") { return NumericFormat::Q5G64_F16S; }
-    if (name == "Q6G64_F16S") { return NumericFormat::Q6G64_F16S; }
-    if (name == "W8G32_F16S") { return NumericFormat::W8G32_F16S; }
-    if (name == "NVFP4") { return NumericFormat::NVFP4; }
-    if (name == "FP8_E4M3FN_ROW_BF16S") { return NumericFormat::FP8_E4M3FN_ROW_BF16S; }
-    throw ArtifactError("unknown tensor format: " + std::string(name));
+    const auto format = find_format(name);
+    if (!format.has_value()) { throw ArtifactError("unknown tensor format: " + std::string(name)); }
+    return *format;
 }
 
 StorageLayout parse_layout(std::string_view name) {
-    if (name == "contiguous-le-v1") { return StorageLayout::ContiguousLeV1; }
-    if (name == "row-split-k128-v1") { return StorageLayout::RowSplitK128V1; }
-    if (name == "blockscale-k16-m128x4-v1") { return StorageLayout::BlockScaleK16M128x4V1; }
-    if (name == "row-scale-v1") { return StorageLayout::RowScaleV1; }
-    throw ArtifactError("unknown tensor layout: " + std::string(name));
+    const auto layout = find_layout(name);
+    if (!layout.has_value()) { throw ArtifactError("unknown tensor layout: " + std::string(name)); }
+    return *layout;
 }
 
 ResourceEncoding parse_encoding(std::string_view name) {
-    if (name == "raw-bytes-v1") { return ResourceEncoding::RawBytesV1; }
-    throw ArtifactError("unknown resource encoding: " + std::string(name));
+    const auto encoding = find_encoding(name);
+    if (!encoding.has_value()) {
+        throw ArtifactError("unknown resource encoding: " + std::string(name));
+    }
+    return *encoding;
 }
 
 TensorDescriptor parse_tensor(const Json& value) {
@@ -250,7 +232,55 @@ private:
     std::size_t size_      = 0;
 };
 
+template <std::size_t N>
+bool magic_matches(std::span<const std::byte> data, const std::array<std::byte, N>& magic) {
+    return data.size() >= N && std::equal(magic.begin(), magic.end(), data.begin());
+}
+
 } // namespace
+
+std::optional<NumericFormat> find_format(std::string_view name) noexcept {
+    // Version-2 spellings.
+    if (name == "BF16") { return NumericFormat::BF16; }
+    if (name == "FP32") { return NumericFormat::FP32; }
+    if (name == "I32") { return NumericFormat::I32; }
+    if (name == "Q4G64_F16S") { return NumericFormat::Q4G64_F16S; }
+    if (name == "Q5G64_F16S") { return NumericFormat::Q5G64_F16S; }
+    if (name == "Q6G64_F16S") { return NumericFormat::Q6G64_F16S; }
+    if (name == "W8G32_F16S") { return NumericFormat::W8G32_F16S; }
+    if (name == "NVFP4") { return NumericFormat::NVFP4; }
+    if (name == "FP8_E4M3FN_ROW_BF16S") { return NumericFormat::FP8_E4M3FN_ROW_BF16S; }
+    // Version-3 spellings.
+    if (name == "bf16") { return NumericFormat::BF16; }
+    if (name == "fp32") { return NumericFormat::FP32; }
+    if (name == "int32") { return NumericFormat::I32; }
+    if (name == "q4_g64_fp16") { return NumericFormat::Q4G64_F16S; }
+    if (name == "q5_g64_fp16") { return NumericFormat::Q5G64_F16S; }
+    if (name == "q6_g64_fp16") { return NumericFormat::Q6G64_F16S; }
+    if (name == "q8_g32_fp16") { return NumericFormat::W8G32_F16S; }
+    if (name == "nvfp4") { return NumericFormat::NVFP4; }
+    if (name == "fp8_e4m3fn_row_bf16") { return NumericFormat::FP8_E4M3FN_ROW_BF16S; }
+    return std::nullopt;
+}
+
+std::optional<StorageLayout> find_layout(std::string_view name) noexcept {
+    if (name == "contiguous-le-v1" || name == "contiguous_le_v1") {
+        return StorageLayout::ContiguousLeV1;
+    }
+    if (name == "row-split-k128-v1" || name == "row_split_k128_v1") {
+        return StorageLayout::RowSplitK128V1;
+    }
+    if (name == "blockscale-k16-m128x4-v1" || name == "block_scale_k16_m128x4_v1") {
+        return StorageLayout::BlockScaleK16M128x4V1;
+    }
+    if (name == "row-scale-v1" || name == "row_scale_v1") { return StorageLayout::RowScaleV1; }
+    return std::nullopt;
+}
+
+std::optional<ResourceEncoding> find_encoding(std::string_view name) noexcept {
+    if (name == "raw-bytes-v1" || name == "raw_bytes_v1") return ResourceEncoding::RawBytesV1;
+    return std::nullopt;
+}
 
 std::string_view object_name(const ObjectDescriptor& object) noexcept {
     return std::visit([](const auto& descriptor) -> std::string_view { return descriptor.name; },
@@ -267,16 +297,27 @@ std::uint64_t object_bytes(const ObjectDescriptor& object) noexcept {
 
 struct Reader::Impl {
     explicit Impl(const std::filesystem::path& path) : file(path) {
-        if (file.size() < kPrefixBytes) {
+        if (magic_matches(std::span(file.data(), file.size()), kEntryMagicV2)) {
+            revision = 2;
+            load_v2();
+        } else if (magic_matches(std::span(file.data(), file.size()), kEntryMagicV3)) {
+            revision = 3;
+            load_v3(path);
+        } else if (file.size() < kHeaderV2Bytes) {
+            throw ArtifactError("artifact is shorter than the container header");
+        } else {
+            throw ArtifactError("artifact magic is not NInfer v2 or v3");
+        }
+    }
+
+    // Version-2: sixteen-byte prefix, one flat directory, one payload region.
+    void load_v2() {
+        if (file.size() < kHeaderV2Bytes) {
             throw ArtifactError("artifact is shorter than the v2 prefix");
         }
-        if (!std::equal(kMagic.begin(), kMagic.end(), file.data())) {
-            throw ArtifactError("artifact magic is not NInfer v2");
-        }
-
         const auto json_bytes = read_u64_le(file.data() + 8);
         if (json_bytes == 0) { throw ArtifactError("json_bytes must be positive"); }
-        const auto metadata_end = checked_add(kPrefixBytes, json_bytes, "JSON range");
+        const auto metadata_end = checked_add(kHeaderV2Bytes, json_bytes, "JSON range");
         payload_start           = align_up(metadata_end, kPayloadAlignment, "payload offset");
         if (metadata_end > file.size() || payload_start > file.size()) {
             throw ArtifactError("declared JSON or payload start extends beyond the file");
@@ -284,7 +325,7 @@ struct Reader::Impl {
 
         Json directory;
         try {
-            const auto* begin = reinterpret_cast<const char*>(file.data() + kPrefixBytes);
+            const auto* begin = reinterpret_cast<const char*>(file.data() + kHeaderV2Bytes);
             directory         = Json::parse(begin, begin + json_bytes);
         } catch (const Json::exception& error) {
             throw ArtifactError(std::string("invalid JSON directory: ") + error.what());
@@ -322,28 +363,127 @@ struct Reader::Impl {
                     }
                 },
                 object);
-
-            if (offset < cursor) {
-                throw ArtifactError("object " + std::string(name) + " overlaps or is out of order");
-            }
-            if (offset % alignment != 0) {
-                throw ArtifactError("object " + std::string(name) + " is not " +
-                                    std::to_string(alignment) + "-byte aligned");
-            }
-            const auto end = checked_add(offset, bytes, "object payload range");
-            if (end > payload_bytes) {
-                throw ArtifactError("object " + std::string(name) + " extends beyond the file");
-            }
+            require_geometry(name, offset, bytes, alignment, payload_bytes, cursor);
             const auto object_index = entries.size();
             auto [_, inserted]      = index.emplace(std::string(name), object_index);
             if (!inserted) { throw ArtifactError("duplicate object name: " + std::string(name)); }
             entries.push_back(std::move(object));
-            cursor = end;
+            cursor = offset + bytes;
+        }
+    }
+
+    // Version-3: thirty-two-byte header, component records, logical bindings and uses, file
+    // directory. Only a single-file set is interpreted for now; a continuation volume set is
+    // rejected instead of silently reading a partial logical payload.
+    void load_v3(const std::filesystem::path& path) {
+        if (file.size() < kHeaderV3Bytes) {
+            throw ArtifactError("artifact is shorter than the v3 header");
+        }
+        const auto json_bytes = read_u64_le(file.data() + 8);
+        if (json_bytes == 0) { throw ArtifactError("json_bytes must be positive"); }
+        const auto metadata_end = checked_add(kHeaderV3Bytes, json_bytes, "JSON range");
+        payload_start           = align_up(metadata_end, kPayloadAlignment, "payload offset");
+        if (metadata_end > file.size() || payload_start > file.size()) {
+            throw ArtifactError("declared JSON or payload start extends beyond the file");
+        }
+        std::copy_n(file.data() + 16, kArtifactIdBytes, artifact_id.begin());
+
+        Json root;
+        try {
+            const auto* begin = reinterpret_cast<const char*>(file.data() + kHeaderV3Bytes);
+            root              = Json::parse(begin, begin + json_bytes);
+        } catch (const Json::exception& error) {
+            throw ArtifactError(std::string("invalid JSON directory: ") + error.what());
+        }
+
+        artifact_directory.emplace(v3::parse_directory(root, path.filename().string()));
+        if (artifact_directory->files.size() != 1) {
+            throw ArtifactError("v3 file sets with " +
+                                std::to_string(artifact_directory->files.size()) +
+                                " volumes are not supported yet; only the entry volume "
+                                "can be read");
+        }
+        const auto expected = checked_add(
+            payload_start, artifact_directory->files.front().payload_bytes, "entry file length");
+        if (expected != file.size()) {
+            throw ArtifactError("entry file is " + std::to_string(file.size()) +
+                                " bytes; the files table declares " + std::to_string(expected));
+        }
+
+        const auto payload_bytes = static_cast<std::uint64_t>(file.size()) - payload_start;
+        entries.reserve(artifact_directory->objects.size());
+        index.reserve(artifact_directory->objects.size());
+        std::uint64_t cursor = 0;
+        for (const auto& object : artifact_directory->objects) {
+            const auto& id    = v3::object_id(object);
+            const auto offset = v3::object_offset(object);
+            const auto bytes  = v3::object_bytes(object);
+            if (const auto* tensor = v3::tensor_object(object)) {
+                const auto format = find_format(tensor->format);
+                if (!format.has_value()) {
+                    throw ArtifactError("tensor '" + id + "' stores unregistered format '" +
+                                        tensor->format + "'");
+                }
+                const auto layout = find_layout(tensor->layout);
+                if (!layout.has_value()) {
+                    throw ArtifactError("tensor '" + id + "' stores unregistered layout '" +
+                                        tensor->layout + "'");
+                }
+                const auto expected_bytes = tensor_encoded_size(*layout, *format, tensor->shape);
+                if (expected_bytes != bytes) {
+                    throw ArtifactError("tensor '" + id + "' stores " + std::to_string(bytes) +
+                                        " bytes; layout requires " +
+                                        std::to_string(expected_bytes));
+                }
+                require_geometry(id, offset, bytes, tensor_alignment(*layout), payload_bytes,
+                                 cursor);
+                TensorDescriptor descriptor{id, tensor->shape, *format, *layout, offset, bytes};
+                const auto object_index = entries.size();
+                if (!index.emplace(id, object_index).second) {
+                    throw ArtifactError("duplicate object id: " + id);
+                }
+                entries.push_back(std::move(descriptor));
+            } else {
+                const auto& resource = std::get<v3::ResourceObject>(object);
+                const auto encoding  = find_encoding(resource.encoding);
+                if (!encoding.has_value()) {
+                    throw ArtifactError("resource '" + id + "' stores unregistered encoding '" +
+                                        resource.encoding + "'");
+                }
+                require_geometry(id, offset, bytes, resource_alignment(*encoding), payload_bytes,
+                                 cursor);
+                ResourceDescriptor descriptor{id, *encoding, offset, bytes};
+                const auto object_index = entries.size();
+                if (!index.emplace(id, object_index).second) {
+                    throw ArtifactError("duplicate object id: " + id);
+                }
+                entries.push_back(std::move(descriptor));
+            }
+            cursor = offset + bytes;
+        }
+    }
+
+    static void require_geometry(std::string_view name, std::uint64_t offset, std::uint64_t bytes,
+                                 std::uint64_t alignment, std::uint64_t payload_bytes,
+                                 std::uint64_t cursor) {
+        if (offset < cursor) {
+            throw ArtifactError("object " + std::string(name) + " overlaps or is out of order");
+        }
+        if (alignment != 0 && offset % alignment != 0) {
+            throw ArtifactError("object " + std::string(name) + " is not " +
+                                std::to_string(alignment) + "-byte aligned");
+        }
+        const auto end = checked_add(offset, bytes, "object payload range");
+        if (end > payload_bytes) {
+            throw ArtifactError("object " + std::string(name) + " extends beyond the payload");
         }
     }
 
     MappedFile file;
+    std::uint32_t revision = 2;
     ArtifactIdentity identity;
+    std::array<std::byte, kArtifactIdBytes> artifact_id{};
+    std::optional<v3::Directory> artifact_directory;
     std::vector<ObjectDescriptor> entries;
     std::unordered_map<std::string, std::size_t, TransparentStringHash, std::equal_to<>> index;
     std::uint64_t payload_start = 0;
@@ -355,7 +495,23 @@ Reader::~Reader()                            = default;
 Reader::Reader(Reader&&) noexcept            = default;
 Reader& Reader::operator=(Reader&&) noexcept = default;
 
-const ArtifactIdentity& Reader::identity() const noexcept { return impl_->identity; }
+std::uint32_t Reader::version() const noexcept { return impl_->revision; }
+
+const ArtifactIdentity& Reader::identity() const {
+    if (impl_->revision != 2) {
+        throw ArtifactError(
+            "a v3 artifact carries component records instead of a model identity; read "
+            "directory().components");
+    }
+    return impl_->identity;
+}
+
+const v3::Directory& Reader::directory() const {
+    if (!impl_->artifact_directory.has_value()) {
+        throw ArtifactError("a v2 artifact has no v3 component directory");
+    }
+    return *impl_->artifact_directory;
+}
 
 const std::vector<ObjectDescriptor>& Reader::objects() const noexcept { return impl_->entries; }
 
@@ -367,6 +523,11 @@ const ObjectDescriptor* Reader::find(std::string_view name) const noexcept {
 std::uint64_t Reader::file_bytes() const noexcept { return impl_->file.size(); }
 
 std::uint64_t Reader::payload_offset() const noexcept { return impl_->payload_start; }
+
+std::span<const std::byte> Reader::artifact_id() const noexcept {
+    if (impl_->revision != 3) { return {}; }
+    return {impl_->artifact_id.data(), impl_->artifact_id.size()};
+}
 
 PayloadSpan Reader::payload(const ObjectDescriptor& object) const {
     const auto absolute =

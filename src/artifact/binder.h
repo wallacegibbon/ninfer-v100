@@ -45,6 +45,24 @@ public:
                                 std::span<const std::uint64_t> shape);
     ObjectHandle require_resource(std::string_view name, ResourceEncoding encoding);
 
+    // Version-3 lookups. A v3 stored object is addressed by an opaque id, so the target asks for
+    // the logical parameters it consumes instead. `require_group` resolves the set of parameters a
+    // native op consumes as one fused weight and requires them to tile exactly one parent object,
+    // which is the shape those ops already take. `require_auxiliary` resolves a per-use auxiliary
+    // such as the activation input divisor. `require_component_resource` resolves a frontend
+    // resource through the component's role map.
+    ObjectHandle require_group(std::span<const std::string_view> names, NumericFormat format,
+                               StorageLayout layout, std::span<const std::uint64_t> shape);
+    ObjectHandle require_auxiliary(std::string_view parameter, std::string_view input,
+                                   std::string_view role, NumericFormat format,
+                                   StorageLayout layout, std::span<const std::uint64_t> shape);
+    ObjectHandle require_component_resource(std::string_view component, std::string_view role,
+                                            ResourceEncoding encoding);
+
+    [[nodiscard]] std::uint32_t version() const noexcept;
+
+    [[nodiscard]] const Reader& reader() const noexcept { return reader_; }
+
     [[nodiscard]] bool contains(std::string_view name) const noexcept;
     const ObjectDescriptor& descriptor(ObjectHandle handle) const;
     PayloadSpan payload(ObjectHandle handle) const;
@@ -55,6 +73,10 @@ public:
 
 private:
     ObjectHandle find_unconsumed(std::string_view name);
+    ObjectHandle use_object(std::size_t index, std::string_view label);
+    void require_tensor_contract(ObjectHandle handle, NumericFormat format, StorageLayout layout,
+                                 std::span<const std::uint64_t> shape,
+                                 std::string_view label) const;
 
     const Reader& reader_;
     std::vector<bool> consumed_;

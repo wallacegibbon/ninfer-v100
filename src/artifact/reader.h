@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -12,6 +13,10 @@
 #include <vector>
 
 namespace ninfer::artifact {
+
+namespace v3 {
+struct Directory; // defined in artifact/schema.h
+} // namespace v3
 
 class ArtifactError : public std::runtime_error {
 public:
@@ -44,6 +49,13 @@ enum class ResourceEncoding {
 std::string_view format_name(NumericFormat format) noexcept;
 std::string_view layout_name(StorageLayout layout) noexcept;
 std::string_view encoding_name(ResourceEncoding encoding) noexcept;
+
+// Persistent-name registries. Both the version-2 spellings and the version-3 snake_case spellings
+// name the same codecs. Unknown names yield empty so an inspector can still show the record; a
+// consumer that has to interpret the bytes reports the missing identity.
+std::optional<NumericFormat> find_format(std::string_view name) noexcept;
+std::optional<StorageLayout> find_layout(std::string_view name) noexcept;
+std::optional<ResourceEncoding> find_encoding(std::string_view name) noexcept;
 
 std::uint64_t tensor_alignment(StorageLayout layout) noexcept;
 std::uint64_t resource_alignment(ResourceEncoding encoding) noexcept;
@@ -139,12 +151,24 @@ public:
     Reader(const Reader&)            = delete;
     Reader& operator=(const Reader&) = delete;
 
-    const ArtifactIdentity& identity() const noexcept;
+    // Framing revision of the opened entry file: 2 or 3.
+    std::uint32_t version() const noexcept;
+
+    // Version-2 hierarchical identity. A version-3 artifact carries component records instead, so
+    // this reports the revision mismatch rather than inventing an identity.
+    const ArtifactIdentity& identity() const;
+
+    // Version-3 directory. Throws for a version-2 artifact.
+    const v3::Directory& directory() const;
+
     const std::vector<ObjectDescriptor>& objects() const noexcept;
     const ObjectDescriptor* find(std::string_view name) const noexcept;
 
     std::uint64_t file_bytes() const noexcept;
     std::uint64_t payload_offset() const noexcept;
+
+    // Version-3 file-set identifier; empty for a version-2 artifact.
+    std::span<const std::byte> artifact_id() const noexcept;
     PayloadSpan payload(const ObjectDescriptor& object) const;
     PayloadSpan payload(std::string_view name) const;
     std::size_t read_direct(std::uint64_t absolute_offset, std::span<std::byte> destination) const;
