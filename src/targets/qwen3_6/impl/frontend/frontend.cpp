@@ -220,8 +220,13 @@ void validate_tokenizer_config(const FrontendResources& resources) {
     }
     if (tokenizer_config.at("chat_template").get_ref<const std::string&>() !=
         resources.chat_template_jinja) {
-        throw std::invalid_argument(
-            "tokenizer_config.json.chat_template does not match frontend/chat_template.jinja");
+        // A v2 artifact embeds the maintained template in tokenizer_config.json, so a difference
+        // means the pair was corrupted. A v3 artifact carries the upstream file verbatim and the
+        // maintained template as its own resource; rendering always uses that resource.
+        if (resources.artifact_version < 3) {
+            throw std::invalid_argument(
+                "tokenizer_config.json.chat_template does not match frontend/chat_template.jinja");
+        }
     }
 }
 

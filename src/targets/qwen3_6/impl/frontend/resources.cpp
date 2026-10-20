@@ -32,6 +32,23 @@ FrontendResourcePlan bind_frontend_resources(artifact::Binder& binder) {
     };
 }
 
+FrontendResourcePlan bind_frontend_resources_v3(artifact::Binder& binder) {
+    return FrontendResourcePlan{
+        .tokenizer_json = artifact::bind_component_resource(binder, "text", "tokenizer.json"),
+        .tokenizer_config_json =
+            artifact::bind_component_resource(binder, "text", "tokenizer_config.json"),
+        .chat_template_jinja =
+            artifact::bind_component_resource(binder, "text", "chat_template.jinja"),
+        .generation_config_json =
+            artifact::bind_component_resource(binder, "text", "generation_config.json"),
+        .preprocessor_config_json =
+            artifact::bind_component_resource(binder, "vision", "preprocessor_config.json"),
+        .video_preprocessor_config_json =
+            artifact::bind_component_resource(binder, "vision", "video_preprocessor_config.json"),
+        .artifact_version = 3,
+    };
+}
+
 FrontendResources take_frontend_resources(artifact::MaterializedArtifact& materialized,
                                           const FrontendResourcePlan& plan) {
     return FrontendResources{
@@ -42,6 +59,7 @@ FrontendResources take_frontend_resources(artifact::MaterializedArtifact& materi
         .preprocessor_config_json = take_string(materialized, plan.preprocessor_config_json),
         .video_preprocessor_config_json =
             take_string(materialized, plan.video_preprocessor_config_json),
+        .artifact_version = plan.artifact_version,
     };
 }
 

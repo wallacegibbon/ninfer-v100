@@ -3,10 +3,13 @@
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
+#include "artifact/schema.h"
 #include "core/device.h"
 #include "core/startup.h"
 #include "runtime/engine/kv_capacity.h"
 #include "runtime/engine/context_cost.h"
+
+#include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -84,19 +87,56 @@ std::size_t current_free_device_bytes() {
     return free_bytes;
 }
 
-template <class Target, class Loaded, class Instance>
+// Model and weight contract selection. A v2 artifact names itself with a hierarchical identity; a
+// v3 artifact carries component configs instead, and only one of them is supported here.
+struct ArtifactSelection {
+    std::string model_id;
+    std::string weights_id;
+};
+
+ArtifactSelection select_artifact(const artifact::Reader& reader) {
+    if (reader.version() == 2) {
+        const auto& identity = reader.identity();
+        return {identity.model_id, identity.weights_id};
+    }
+
+    const auto& directory   = reader.directory();
+    const auto& config      = directory.component("text").config;
+    const auto architecture = config.contains("architectures") &&
+                                      config.at("architectures").is_array() &&
+                                      !config.at("architectures").empty()
+                                  ? config.at("architectures").at(0).get<std::string>()
+                                  : std::string{};
+    const bool supported =
+        architecture == "Qwen3_5ForCausalLM" &&
+        config.value("model_type", std::string{}) == "qwen3_5_text" &&
+        config.value("hidden_size", 0) == 5120 && config.value("num_hidden_layers", 0) == 64 &&
+        config.value("intermediate_size", 0) == 17408 && config.value("vocab_size", 0) == 248320;
+    if (!supported) {
+        throw std::runtime_error(
+            "v3 artifact text config is not the supported 27B dense Qwen3.5 contract");
+    }
+    if (directory.name != Qwen3_6_27B::qwen3_8_model_id) {
+        throw std::runtime_error("v3 artifact '" + directory.name +
+                                 "' has no registered target; only '" +
+                                 std::string(Qwen3_6_27B::qwen3_8_model_id) + "' is supported");
+    }
+    // The v3 container does not store a weights_id. This contract is the published nvfp4 mix.
+    return {directory.name, "nvfp4"};
+}
+
+template <class Target, class Loaded, class Instance, class Profile>
 ConstructedTarget construct_registered(const EngineOptions& options, DeviceContext& device,
                                        artifact::Reader& reader, Clock::time_point load_start,
-                                       std::string_view target_key) {
+                                       std::string_view target_key, Profile weights_profile,
+                                       const ArtifactSelection& selection) {
     StartupPhaseScope target_plan_phase(options.startup_observer, StartupPhase::TargetPlan);
-    const auto& identity                          = reader.identity();
-    const auto weights_profile                    = Target::resolve_weights(identity);
-    const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(identity.model_id);
+    const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(selection.model_id);
     const runtime::ContextCostIdentity context_cost_identity{
         .hardware_class = runtime::context_cost_hardware_class(
             device.props.name, device.props.major, device.props.minor),
-        .model_id   = identity.model_id,
-        .weights_id = identity.weights_id,
+        .model_id   = selection.model_id,
+        .weights_id = selection.weights_id,
     };
     runtime::ResolvedContextMachineCost context_cost = runtime::resolve_context_machine_cost(
         context_cost_identity, options.context_cost.preset_path);
@@ -140,8 +180,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
     LoadSummary summary;
     summary.target               = std::string(target_key);
-    summary.model_id             = identity.model_id;
-    summary.weights_id           = identity.weights_id;
+    summary.model_id             = selection.model_id;
+    summary.weights_id           = selection.weights_id;
     summary.load_seconds         = std::chrono::duration<double>(Clock::now() - load_start).count();
     summary.upload_seconds       = stats.upload_seconds;
     summary.artifact_bytes_read  = stats.file_bytes;
@@ -201,21 +241,27 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
     StartupPhaseScope inspect_phase(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);
     inspect_phase.complete();
-    const auto& identity = reader.identity();
-    if (identity.model_id == Qwen3_6_27B::model_id) {
+    const ArtifactSelection selection = select_artifact(reader);
+    const bool legacy                 = reader.version() == 2;
+    if (selection.model_id == Qwen3_6_27B::model_id) {
         return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
-            options, device, reader, load_start, Qwen3_6_27B::target_key);
+            options, device, reader, load_start, Qwen3_6_27B::target_key,
+            Qwen3_6_27B::resolve_weights(reader.identity()), selection);
     }
-    if (identity.model_id == Qwen3_6_27B::qwen3_8_model_id) {
+    if (selection.model_id == Qwen3_6_27B::qwen3_8_model_id) {
+        const auto weights_profile = legacy ? Qwen3_6_27B::resolve_weights(reader.identity())
+                                            : Qwen3_6_27B::WeightsProfile::Qwen38Nvfp4;
         return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
-            options, device, reader, load_start, Qwen3_6_27B::qwen3_8_target_key);
+            options, device, reader, load_start, Qwen3_6_27B::qwen3_8_target_key, weights_profile,
+            selection);
     }
-    if (identity.model_id == Qwen3_6_35BA3B::model_id) {
+    if (selection.model_id == Qwen3_6_35BA3B::model_id) {
         return construct_registered<Qwen3_6_35BA3B, LoadedQwen3_6_35BA3B, Qwen3_6_35BA3BInstance>(
-            options, device, reader, load_start, Qwen3_6_35BA3B::target_key);
+            options, device, reader, load_start, Qwen3_6_35BA3B::target_key,
+            Qwen3_6_35BA3B::resolve_weights(reader.identity()), selection);
     }
-    throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
-                             "' has no registered target for this device");
+    throw std::runtime_error("artifact identity '" + selection.model_id + "/" +
+                             selection.weights_id + "' has no registered target for this device");
 }
 
 } // namespace ninfer::targets

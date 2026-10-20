@@ -94,6 +94,13 @@ struct VisionWeights {
 
 [[nodiscard]] VisionBackbonePlan bind_vision_backbone(artifact::Binder& binder,
                                                       artifact::TensorPlacement placement);
+// Version-3 form: fused Q/K/V and their bias bank are logical groups of the same parent object.
+[[nodiscard]] VisionBackbonePlan bind_vision_backbone_v3(artifact::Binder& binder,
+                                                         artifact::TensorPlacement placement);
+[[nodiscard]] VisionMergerInputPlan
+bind_vision_merger_input_v3(artifact::Binder& binder, artifact::TensorPlacement placement);
+[[nodiscard]] VisionMergerNormPlan bind_vision_merger_norm_v3(artifact::Binder& binder,
+                                                              artifact::TensorPlacement placement);
 [[nodiscard]] VisionMergerInputPlan bind_vision_merger_input(artifact::Binder& binder,
                                                              artifact::TensorPlacement placement);
 [[nodiscard]] VisionMergerNormPlan bind_vision_merger_norm(artifact::Binder& binder,

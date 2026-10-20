@@ -1,6 +1,10 @@
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
 
+#include "artifact/schema.h"
 #include "artifact/typed_binding.h"
+
+#include <nlohmann/json.hpp>
+
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/linear/fp8/fp8_prepack_sm70.h"
 #include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
@@ -482,10 +486,321 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
     }
 }
 
+// --- Version 3 ------------------------------------------------------------------------------
+// A v3 artifact stores opaque object ids, so the target asks for the logical parameters it
+// consumes. Every fused group below was verified to tile exactly one parent object, so the native
+// ops keep receiving the same fused weight they already expect. Only the qwen3.8-27b nvfp4
+// contract is implemented; anything else must fail instead of being guessed.
+
+WeightPlan bind_v3_weight(artifact::Binder& binder, std::string_view name, NumericFormat format,
+                          std::initializer_list<std::uint64_t> shape,
+                          artifact::TensorPlacement placement) {
+    if (format == NumericFormat::NVFP4) {
+        throw std::logic_error("NVFP4 weight requires a paired input divisor");
+    }
+    return WeightPlan{.object = artifact::bind_tensor(binder, name, format, shape, placement),
+                      .format = format};
+}
+
+WeightPlan bind_v3_group(artifact::Binder& binder, const std::string& prefix,
+                         std::initializer_list<std::string_view> roles, NumericFormat format,
+                         std::initializer_list<std::uint64_t> shape,
+                         artifact::TensorPlacement placement) {
+    if (format == NumericFormat::NVFP4) {
+        throw std::logic_error("NVFP4 weight requires a paired input divisor");
+    }
+    return WeightPlan{
+        .object = artifact::bind_group_roles(binder, prefix, roles, format, shape, placement),
+        .format = format};
+}
+
+std::uint32_t read_divisor_bits(artifact::Binder& binder, artifact::ObjectHandle handle,
+                                std::uint64_t offset, std::string_view label) {
+    const std::uint32_t bits = read_u32_le(binder.payload(handle).data, offset, label);
+    require_positive_finite(bits, label);
+    return bits;
+}
+
+// NVFP4 parent plus the activation divisor of the use position that consumes it.
+WeightPlan bind_v3_nvfp4(artifact::Binder& binder, artifact::ObjectHandle parent, std::int32_t rows,
+                         std::int32_t columns, std::string_view label,
+                         artifact::ObjectHandle input_divisor) {
+    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
+                                                static_cast<std::uint64_t>(columns)};
+    const artifact::BlockScaleGeometry geometry =
+        artifact::block_scale_geometry(NumericFormat::NVFP4, shape);
+    return WeightPlan{
+        .object = parent,
+        .format = NumericFormat::NVFP4,
+        .weight_scale_divisor_bits =
+            read_divisor_bits(binder, parent, geometry.weight_divisor_offset, label),
+        .input_scale_divisor_bits = read_divisor_bits(binder, input_divisor, 0, label),
+    };
+}
+
+void bind_v3_qwen38_text_layers(artifact::Binder& binder, BindingPlan& out) {
+    constexpr NumericFormat kFp8 = NumericFormat::FP8_E4M3FN_ROW_BF16S;
+    constexpr auto kDevice       = artifact::TensorPlacement::Device;
+    for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
+        TextLayerPlan& target    = out.text_layers[layer];
+        const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
+        target.input_norm        = artifact::bind_device_tensor(binder, prefix + "input_norm",
+                                                                NumericFormat::BF16, {5120});
+        target.is_full_attention = is_full_layer(layer);
+        if (target.is_full_attention) {
+            target.attention.projection = FusedAttentionProjectionPlan{
+                .query_key_gate_value = bind_v3_group(
+                    binder, prefix,
+                    {"attention/query", "attention/key", "attention/gate", "attention/value"}, kFp8,
+                    {14336, 5120}, kDevice),
+            };
+            target.attention.query_norm = artifact::bind_device_tensor(
+                binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
+            target.attention.key_norm = artifact::bind_device_tensor(
+                binder, prefix + "attention/key_norm", NumericFormat::BF16, {256});
+            target.attention.output =
+                bind_v3_weight(binder, prefix + "attention/output", kFp8, {5120, 6144}, kDevice);
+        } else {
+            target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
+                                                                  NumericFormat::FP32, {48});
+            target.gdn.dt_bias     = artifact::bind_device_tensor(binder, prefix + "gdn/dt_bias",
+                                                                  NumericFormat::FP32, {48});
+            target.gdn.convolution = artifact::bind_device_tensor(
+                binder, prefix + "gdn/convolution", NumericFormat::BF16, {4, 10240});
+            target.gdn.control_projection = FusedGdnControlProjectionPlan{
+                .a_b_projection =
+                    bind_v3_group(binder, prefix, {"gdn/a_projection", "gdn/b_projection"},
+                                  NumericFormat::BF16, {96, 5120}, kDevice),
+            };
+            target.gdn.input_projection = FusedGdnInputProjectionPlan{
+                .query_key_value_z =
+                    bind_v3_group(binder, prefix, {"gdn/query", "gdn/key", "gdn/value", "gdn/z"},
+                                  kFp8, {16384, 5120}, kDevice),
+            };
+            target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
+                                                           NumericFormat::BF16, {128});
+            target.gdn.output =
+                bind_v3_weight(binder, prefix + "gdn/output", kFp8, {5120, 6144}, kDevice);
+        }
+        target.post_attention_norm = artifact::bind_device_tensor(
+            binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
+        if (layer < 56) {
+            // The fused gate/up parent serves two use positions, each with its own activation
+            // divisor. The fused op consumes one value, so they must agree.
+            const std::string gate_parameter = prefix + "mlp/gate";
+            const std::string up_parameter   = prefix + "mlp/up";
+            const std::string ffn_input      = prefix + "ffn_input";
+            const artifact::ObjectHandle parent =
+                artifact::bind_group_roles(binder, prefix, {"mlp/gate", "mlp/up"},
+                                           NumericFormat::NVFP4, {34816, 5120}, kDevice);
+            const auto gate_divisor =
+                artifact::bind_auxiliary(binder, gate_parameter, ffn_input, NumericFormat::FP32, {},
+                                         artifact::TensorPlacement::ValidateOnly);
+            const auto up_divisor =
+                artifact::bind_auxiliary(binder, up_parameter, ffn_input, NumericFormat::FP32, {},
+                                         artifact::TensorPlacement::ValidateOnly);
+            const auto gate_bits = read_divisor_bits(binder, gate_divisor, 0, gate_parameter);
+            const auto up_bits   = read_divisor_bits(binder, up_divisor, 0, up_parameter);
+            if (gate_bits != up_bits) {
+                throw artifact::ArtifactError("fused gate/up activation divisors disagree at " +
+                                              prefix + "; the fused op consumes a single divisor");
+            }
+            target.mlp.gate_up =
+                bind_v3_nvfp4(binder, parent, 34816, 5120, prefix + "mlp/gate_up", gate_divisor);
+
+            const std::string down_parameter         = prefix + "mlp/down";
+            const artifact::ObjectHandle down_parent = artifact::bind_tensor(
+                binder, down_parameter, NumericFormat::NVFP4, {5120, 17408}, kDevice);
+            const auto down_divisor = artifact::bind_auxiliary(
+                binder, down_parameter, prefix + "mlp/product", NumericFormat::FP32, {},
+                artifact::TensorPlacement::ValidateOnly);
+            target.mlp.down =
+                bind_v3_nvfp4(binder, down_parent, 5120, 17408, down_parameter, down_divisor);
+        } else {
+            target.mlp.gate_up =
+                bind_v3_group(binder, prefix, {"mlp/gate", "mlp/up"}, kFp8, {34816, 5120}, kDevice);
+            target.mlp.down =
+                bind_v3_weight(binder, prefix + "mlp/down", kFp8, {5120, 17408}, kDevice);
+        }
+    }
+}
+
+void bind_v3_mtp(artifact::Binder& binder, MtpPlan& out, artifact::TensorPlacement placement) {
+    constexpr NumericFormat kQ8 = NumericFormat::W8G32_F16S;
+    const std::string prefix    = "mtp/layers/0/";
+    const auto bind             = [&](std::string_view name, NumericFormat format,
+                          std::initializer_list<std::uint64_t> shape) {
+        return artifact::bind_tensor(binder, name, format, shape, placement);
+    };
+    out.input_projection     = bind("mtp/input_projection", kQ8, {5120, 10240});
+    out.embedding_norm       = bind("mtp/embedding_norm", NumericFormat::BF16, {5120});
+    out.hidden_norm          = bind("mtp/hidden_norm", NumericFormat::BF16, {5120});
+    out.input_norm           = bind(prefix + "input_norm", NumericFormat::BF16, {5120});
+    out.query_key_gate_value = artifact::bind_group_roles(
+        binder, prefix, {"attention/query", "attention/key", "attention/gate", "attention/value"},
+        kQ8, {14336, 5120}, placement);
+    out.query_norm          = bind(prefix + "attention/query_norm", NumericFormat::BF16, {256});
+    out.key_norm            = bind(prefix + "attention/key_norm", NumericFormat::BF16, {256});
+    out.output              = bind(prefix + "attention/output", kQ8, {5120, 6144});
+    out.post_attention_norm = bind(prefix + "post_attention_norm", NumericFormat::BF16, {5120});
+    out.mlp.gate_up =
+        WeightPlan{.object = artifact::bind_group_roles(binder, prefix, {"mlp/gate", "mlp/up"}, kQ8,
+                                                        {34816, 5120}, placement),
+                   .format = kQ8};
+    out.mlp.down =
+        WeightPlan{.object = bind(prefix + "mlp/down", kQ8, {5120, 17408}), .format = kQ8};
+    out.final_norm = bind("mtp/final_norm", NumericFormat::BF16, {5120});
+}
+
+DFlash2Plan bind_v3_dflash2(artifact::Binder& binder, artifact::TensorPlacement placement) {
+    constexpr NumericFormat kQ8 = NumericFormat::W8G32_F16S;
+    const auto bind             = [&](std::string_view name, NumericFormat format,
+                          std::initializer_list<std::uint64_t> shape) {
+        return artifact::bind_tensor(binder, name, format, shape, placement);
+    };
+    const auto weight = [&](std::string_view name, NumericFormat format,
+                            std::initializer_list<std::uint64_t> shape) {
+        return bind_v3_weight(binder, name, format, shape, placement);
+    };
+
+    DFlash2Plan out;
+    out.feature_projection = weight("dflash2/feature_projection", kQ8, {5120, 25600});
+    out.context_norm       = bind("dflash2/context_norm", NumericFormat::BF16, {5120});
+    for (std::size_t layer = 0; layer < out.layers.size(); ++layer) {
+        DFlash2LayerPlan& target = out.layers[layer];
+        const std::string prefix = "dflash2/layers/" + std::to_string(layer) + "/";
+        target.input_norm        = bind(prefix + "input_norm", NumericFormat::BF16, {5120});
+        target.attention_conv.base_kernel =
+            bind(prefix + "attention_conv/base_kernel", NumericFormat::BF16, {2, 2, 5120});
+        target.attention_conv.kernel_projection =
+            weight(prefix + "attention_conv/kernel_projection", NumericFormat::BF16, {1280, 5120});
+        // Query, key and value share one bank; context K/V alias the key/value window of it.
+        target.query_key_value =
+            WeightPlan{.object = artifact::bind_group_roles(
+                           binder, prefix, {"attention/query", "attention/key", "attention/value"},
+                           kQ8, {6144, 5120}, placement),
+                       .format = kQ8};
+        target.query_norm       = bind(prefix + "attention/query_norm", NumericFormat::BF16, {128});
+        target.key_norm         = bind(prefix + "attention/key_norm", NumericFormat::BF16, {128});
+        target.attention_output = weight(prefix + "attention/output", kQ8, {5120, 4096});
+        target.post_attention_norm =
+            bind(prefix + "post_attention_norm", NumericFormat::BF16, {5120});
+        target.mlp_conv.base_kernel =
+            bind(prefix + "mlp_conv/base_kernel", NumericFormat::BF16, {2, 2, 5120});
+        target.mlp_conv.kernel_projection =
+            weight(prefix + "mlp_conv/kernel_projection", NumericFormat::BF16, {1280, 5120});
+        target.gate_up =
+            WeightPlan{.object = artifact::bind_group_roles(binder, prefix, {"mlp/gate", "mlp/up"},
+                                                            kQ8, {34816, 5120}, placement),
+                       .format = kQ8};
+        target.down = weight(prefix + "mlp/down", kQ8, {5120, 17408});
+    }
+    out.final_norm = bind("dflash2/final_norm", NumericFormat::BF16, {5120});
+    out.candidate_selector.hidden_projection =
+        weight("dflash2/candidate_selector/hidden_projection", NumericFormat::BF16, {256, 5120});
+    out.candidate_selector.predecessor_codebook =
+        bind("dflash2/candidate_selector/predecessor_codebook", NumericFormat::BF16, {248320, 256});
+    out.candidate_selector.successor_codebook =
+        bind("dflash2/candidate_selector/successor_codebook", NumericFormat::BF16, {248320, 256});
+    return out;
+}
+
+// Rejects any v3 artifact that is not exactly the supported qwen3.8-27b nvfp4 contract.
+void require_v3_qwen38_nvfp4_contract(const artifact::Binder& binder,
+                                      WeightsProfile weights_profile) {
+    if (weights_profile != WeightsProfile::Qwen38Nvfp4) {
+        throw artifact::ArtifactError("v3 artifacts are supported only for the qwen3.8-27b nvfp4 "
+                                      "weights profile");
+    }
+    const auto& directory   = binder.reader().directory();
+    const auto& text        = directory.component("text");
+    const auto& config      = text.config;
+    const auto architecture = config.contains("architectures") &&
+                                      config.at("architectures").is_array() &&
+                                      !config.at("architectures").empty()
+                                  ? config.at("architectures").at(0).get<std::string>()
+                                  : std::string{};
+    const bool supported =
+        architecture == "Qwen3_5ForCausalLM" &&
+        config.value("model_type", std::string{}) == "qwen3_5_text" &&
+        config.value("hidden_size", 0) == 5120 && config.value("num_hidden_layers", 0) == 64 &&
+        config.value("intermediate_size", 0) == 17408 && config.value("vocab_size", 0) == 248320;
+    if (!supported) {
+        throw artifact::ArtifactError("v3 text config is not the supported 27B dense Qwen3.5 "
+                                      "contract");
+    }
+    if (!text.proposal.has_value() || !text.proposal->indexed || text.proposal->rows != 131072) {
+        throw artifact::ArtifactError(
+            "v3 artifact must declare the indexed 131072-row proposal domain");
+    }
+}
+
+ArtifactLoadPlan bind_artifact_v3(artifact::Binder& binder, WeightsProfile weights_profile,
+                                  qwen3_6::StartupFeatures features) {
+    require_v3_qwen38_nvfp4_contract(binder, weights_profile);
+
+    ArtifactLoadPlan load_plan;
+    BindingPlan& out             = load_plan.bindings;
+    constexpr NumericFormat kFp8 = NumericFormat::FP8_E4M3FN_ROW_BF16S;
+
+    out.frontend = qwen3_6::bind_frontend_resources_v3(binder);
+    out.features = features;
+
+    out.token_embedding = bind_v3_weight(binder, "text/token_embedding", kFp8, {248320, 5120},
+                                         artifact::TensorPlacement::Device);
+    bind_v3_qwen38_text_layers(binder, out);
+    out.final_norm =
+        artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {5120});
+    out.output_head = bind_v3_weight(binder, "text/output_head", kFp8, {248320, 5120},
+                                     artifact::TensorPlacement::Device);
+
+    const artifact::TensorPlacement proposal_placement =
+        features.optimized_proposal() ? artifact::TensorPlacement::Device
+                                      : artifact::TensorPlacement::ValidateOnly;
+    out.draft_head = artifact::bind_tensor(binder, "proposal/head", NumericFormat::Q4G64_F16S,
+                                           {131072, 5120}, proposal_placement);
+    out.draft_head_token_ids = artifact::bind_tensor(
+        binder, "proposal/token_ids", NumericFormat::I32, {131072}, proposal_placement);
+    validate_draft_ids(binder, out.draft_head_token_ids);
+
+    const artifact::TensorPlacement mtp_placement = features.mtp()
+                                                        ? artifact::TensorPlacement::Device
+                                                        : artifact::TensorPlacement::ValidateOnly;
+    bind_v3_mtp(binder, out.mtp, mtp_placement);
+
+    const artifact::TensorPlacement vision_placement =
+        features.vision ? artifact::TensorPlacement::Device
+                        : artifact::TensorPlacement::ValidateOnly;
+    out.vision_backbone     = qwen3_6::bind_vision_backbone_v3(binder, vision_placement);
+    out.vision_merger_input = qwen3_6::bind_vision_merger_input_v3(binder, vision_placement);
+    out.vision_merger_fc2   = artifact::bind_tensor(
+        binder, "vision/merger/fc2", NumericFormat::W8G32_F16S, {5120, 4608}, vision_placement);
+    out.vision_merger_fc2_bias = artifact::bind_tensor(
+        binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, vision_placement);
+    out.vision_merger_norm = qwen3_6::bind_vision_merger_norm_v3(binder, vision_placement);
+
+    const bool has_dflash2 = binder.contains("dflash2/feature_projection");
+    if (features.dflash2() && !has_dflash2) {
+        throw artifact::ArtifactError(
+            "DFlash2 was selected but the artifact has no DFlash2 weight bundle");
+    }
+    if (has_dflash2) {
+        const artifact::TensorPlacement placement = features.dflash2()
+                                                        ? artifact::TensorPlacement::Device
+                                                        : artifact::TensorPlacement::ValidateOnly;
+        out.dflash2                               = bind_v3_dflash2(binder, placement);
+    }
+
+    load_plan.materialization = binder.finish();
+    return load_plan;
+}
+
 } // namespace
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3_6::StartupFeatures features) {
+    if (binder.version() == 3) { return bind_artifact_v3(binder, weights_profile, features); }
+
     ArtifactLoadPlan load_plan;
     BindingPlan& out = load_plan.bindings;
     out.frontend     = qwen3_6::bind_frontend_resources(binder);
